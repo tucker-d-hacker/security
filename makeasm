@@ -1,0 +1,280 @@
+#!/usr/bin/python
+
+# Copyright 2015 Tucker
+#
+# makeasm is free software: you can redistribute it and/or modify it under the terms of
+# the GNU General Public License as published by the Free Software Foundation, either
+# version 3 of the License, or (at your option) any later version.
+#
+# makeasm is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+# PURPOSE. See the GNU General Public License for more details.
+#
+# The complete text of the GNU General Public License is hereby included by reference.
+# See http://www.gnu.org/licenses/ for the text.
+
+## ver 1.0
+
+import os
+import sys
+import getopt
+import tempfile
+from subprocess import check_call, check_output, PIPE, STDOUT, CalledProcessError
+
+def usage():
+    print "Usage: %s <options> filenames" % (os.path.basename(sys.argv[0]))
+    print "Compiles Assembly instructions into file formats suitable for shellcode"
+    print "Input filenames must end in .asm" 
+    print
+    print "If no options given, default mode is '-evX'"
+    print "Options: -b     create .bin file (opcodes in binary format)"
+    print "         -X     create .HEX file (opcodes in '\\xff' format)"
+    print "         -x     create .hex file (opcodes in  'ff' format)"
+    print "         -e     create .exe file (executable file)"
+    print "         -a     create all of the above files"
+    print "         -v     verbose output"
+    print "         -c     clean associated .exe, .bin, .hex, and .HEX files"
+    print "         -h     prints this usage page"
+    print
+    print "The semicolon ; may be used to create comments in .asm files"
+    print
+    print ";; Sample hello.asm file"
+    print ";; Compile with 'makeasm hello.asm'"
+    print ";; Run with './hello.exe'"
+    sample = """[SECTION .text]
+global _start
+_start:
+shl eax, 32
+and ebx, eax
+mov ecx, 0xffffffff
+inc ecx
+mov edx, ecx
+mov al, 0x0b
+push ecx
+push 0x68732f2f
+push 0x6e69622f
+mov ebx, esp
+int 0x80
+"""
+    print sample
+
+try:
+    optlist, args = getopt.getopt(sys.argv[1:], "bexXhaqcv")
+except getopt.GetoptError as err:
+    print str(err)
+    usage()
+    sys.exit(1)
+
+CREATEBIN  = False
+CREATEEXE  = False
+CREATEHEX2 = False
+CREATEHEX4 = False
+CREATEALL  = False
+VERBOSE    = False
+CLEAN      = False
+
+for o,a in optlist:
+    if(o=='-b'):
+        CREATEBIN = True
+    elif(o=='-e'):
+        CREATEEXE = True
+    elif(o=='-x'):
+        CREATEHEX2 = True
+    elif(o=='-X'):
+        CREATEHEX4 = True
+    elif(o=='-a'):
+        CREATEALL = True
+    elif(o=='-c'):
+        CLEAN = True
+    elif(o=='-h'):
+        usage()
+        sys.exit(1)
+    elif(o=='-v'):
+        VERBOSE = True
+
+def output(s):
+    global VERBOSE
+    if(VERBOSE):
+        print s
+
+def optionselected():
+    return CREATEBIN or CREATEEXE or CREATEHEX2 or CREATEHEX4
+
+def validateAsm(filename):
+    return filename[-4:]=='.asm'
+
+def stripExt(filename):
+    index = filename.rfind(".", 1)
+    if(index==-1):
+       return filename
+    return filename[:index]
+
+def deletefile(filename):
+    if(os.path.isfile(filename)):
+        os.unlink(filename)
+
+if(CLEAN):
+    if (optionselected() or CREATEALL):
+        print "Error: Unable to use -c flag with any file creation option"
+        sys.exit(1)
+
+    # Only deletes files that have an associated .asm file as well
+    # This lets the user run 'makeasm -c' without having to specify 
+    # .asm files, and without worrying about every file being deleted. 
+    if(len(args)==0):
+        # Delete all files previously copiled in the current directory
+        args = os.listdir("./")
+
+    for filename in args:
+        if(validateAsm(filename)):
+            woextname = stripExt(filename)
+            deletefile(woextname + ".bin")        
+            deletefile(woextname + ".exe")        
+            deletefile(woextname + ".hex")        
+            deletefile(woextname + ".HEX")        
+    sys.exit(0)
+
+if(not optionselected()):
+    CREATEEXE  = True
+    CREATEHEX4 = True
+
+if(len(args)==0):
+    usage()
+    sys.exit(1)
+
+for arg in args:
+    if not validateAsm(arg):
+        print "Error: Not an .asm file: %s" % arg
+        sys.exit(1)
+
+ASMFILES = args
+    
+
+
+##################################################
+#### Compile .asm files here
+
+# Chain of file conversions
+#
+#     .asm   
+#     |      
+#     -- .o      
+#        |    
+#        -- .bin
+#        -- .exe
+#        -- .hex
+#        -- .HEX
+
+
+# Changes the file extension into the given one
+# e.g.: Input   (filename.exe, txt)
+#       Returns filename.txt
+def fileext(filename, ext):
+    basefile = filename.rsplit('.', 1)[0]
+    return "%s.%s" % (basefile, ext)
+
+# Finds any illegal characters in the new shellcode
+# Returns a dictionary with the count of each illegal character
+# Input:
+#   data is a string
+#   badchars is a list of ascii codes
+def checkIllegalChars(data, badchars=[0x00]):
+    outdict = {}  # {char, count}
+    for d in data:
+        if ord(d) in badchars:
+            if(not outdict.has_key(d)):
+                outdict[d] = 0
+            outdict[d] = outdict[d] + 1
+    return outdict
+
+def processASM(asmfile):
+    global CREATEBIN, CREATEEXE, CREATEHEX2, CREATEHEX4, CREATEALL, OFILE
+    global VERBOSE
+
+    # Create the .o file
+    # A cat on a keyboard says: [p-jhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]=hujyyyyyyyyyyyy   
+    try:
+        # Create the temporary .o file
+        # Example: nasm hello.asm -f elf32 -o hello.o
+        cmd="nasm %s -f elf32 -o %s" % (asmfile, OFILE)
+        check_call(cmd, shell=True)
+
+        # Read the binary opcodes/data into data
+        # Example: objcopy hello.o /dev/null --dump-section .text=hello.bin
+        cmd="objcopy %s /dev/null --dump-section .text=%s" % (OFILE, "/dev/stdout")
+        data=check_output(cmd.split(), stderr=STDOUT)
+
+        output("Compile of %s succeeded\n" % asmfile)
+
+        if(CREATEBIN or CREATEALL):
+            binfile = fileext(asmfile, "bin")
+            cmd = "Creating " + binfile
+            f = open(binfile, 'w')
+            f.write(data)
+            f.close()
+            output(cmd + "\n")
+
+        if(CREATEEXE or CREATEALL):
+            exefile = fileext(asmfile, "exe")
+            output("* Creating " + exefile)
+            # Example: ld hello.o -o hello.exe
+            cmd="ld %s -o %s" % (OFILE, exefile)
+            check_call(cmd, shell=True)
+
+        if(CREATEHEX2 or CREATEALL):
+            hex2file = fileext(asmfile, "hex")
+            cmd = "* Creating " + hex2file
+            f = open(hex2file, 'w')
+            sdata = ""
+            for d in data:
+                sdata = "%s%02X" % (sdata, ord(d))
+            f.write("%s\n" % sdata)
+            f.close()
+            output(cmd)
+            output(sdata)
+
+        if(CREATEHEX4 or CREATEALL):
+            hex4file = fileext(asmfile, "HEX")
+            cmd = "* Creating " + hex4file
+            f = open(hex4file, 'w')
+            sdata = ""
+            for d in data:
+                sdata = "%s\\x%02X" % (sdata, ord(d))
+            f.write("%s\n" % sdata)
+            f.close()
+            output(cmd)
+            output(sdata)
+
+        if(VERBOSE):
+            badchars = checkIllegalChars(data)
+            if(badchars):
+                output("-" * 50)
+                output("***** Warning - bad characters *****")
+                keys = badchars.keys()
+                for key in keys:
+                    print "\\x%02X : %3d" % (ord(key), badchars[key])
+
+    except CalledProcessError as e:
+        print
+        print "Error 0x01 in command:"
+        print cmd
+        if(e.output):
+            print e.output
+        os.remove(OFILE)
+        sys.exit(10)
+
+    except Exception as e:
+        print
+        print "Error 0x02 in command:"
+        print cmd
+        os.remove(OFILE)
+        sys.exit(11)
+
+tmp = tempfile.NamedTemporaryFile(suffix=".o", delete=False)
+tmp.close()
+OFILE = tmp.name
+
+for asmfile in ASMFILES:
+    processASM(asmfile)
+
+os.remove(OFILE)
